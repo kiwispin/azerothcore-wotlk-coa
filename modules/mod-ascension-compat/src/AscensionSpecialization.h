@@ -29,6 +29,10 @@ bool SetAscensionTalentRank(Player* player, uint32 entryId, uint32 rank);
 // Whether a class id is one of the CoA custom classes.
 bool IsAscensionCustomClassId(uint8 classId);
 
+// Places the authoritative level-one CoA starter kit on an already-created player without applying
+// character-creation-only state or policies. Intended for Playerbots and other repair-safe callers.
+bool InitializeAscensionPlayerbotStarterKit(Player* player);
+
 // A spell a CoA class can learn.
 struct AscensionClassAbility
 {

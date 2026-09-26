@@ -1098,6 +1098,257 @@ public:
     return true;
   }
 
+  struct ValidatedStarterItem
+  {
+    AscensionCompatData::LiveStarterItem const* Entry;
+    uint16 EquipmentDestination = 0;
+    ItemPosCountVec BagDestinations;
+    Item* Existing = nullptr;
+    Item* Conflicting = nullptr;
+    uint16 RehomeDestination = 0;
+  };
+
+  bool InitializeLiveStarterItems(Player* player, bool update)
+  {
+    if (!IsAscensionCustomClass(player))
+      return false;
+
+    std::vector<AscensionCompatData::LiveStarterItem const*> entries;
+    std::unordered_set<uint16> positions;
+    for (AscensionCompatData::LiveStarterItem const& entry : AscensionCompatData::LiveStarterItems)
+    {
+      if (entry.ClassId != player->getClass())
+        continue;
+
+      bool const equipped = entry.Slot < EQUIPMENT_SLOT_END;
+      uint16 const position = uint16(entry.Bag) << 8 | entry.Slot;
+      ItemTemplate const* item = sObjectMgr->GetItemTemplate(entry.ItemId);
+      if (entry.Bag != INVENTORY_SLOT_BAG_0 ||
+          (!equipped && (entry.Slot < INVENTORY_SLOT_ITEM_START || entry.Slot >= INVENTORY_SLOT_ITEM_END)) ||
+          !entry.Count || !item || entry.Count > item->GetMaxStackSize() ||
+          (equipped && entry.Count != 1) || !positions.insert(position).second)
+      {
+        LOG_ERROR("module.ascension_compat", "Invalid live starter class {} item {} bag {} slot {} count {}",
+            uint32(entry.ClassId), entry.ItemId, uint32(entry.Bag), uint32(entry.Slot), entry.Count);
+        return false;
+      }
+      entries.push_back(&entry);
+    }
+
+    if (entries.empty())
+      return false;
+
+    std::vector<ValidatedStarterItem> validated;
+    std::unordered_set<uint16> rehomeDestinations;
+    for (AscensionCompatData::LiveStarterItem const* entry : entries)
+    {
+      bool const equipped = entry->Slot < EQUIPMENT_SLOT_END;
+      uint16 const position = uint16(entry->Bag) << 8 | entry->Slot;
+      Item* const existing = player->GetItemByPos(entry->Bag, entry->Slot);
+      ValidatedStarterItem itemPlan{ entry };
+
+      if (existing && existing->GetEntry() == entry->ItemId && existing->GetCount() == entry->Count)
+      {
+        // PlayerbotFactory intentionally preserves some quest/utility items while clearing a bot. If the
+        // authoritative starter item already occupies its exact destination, keep it and validate the rest.
+        itemPlan.Existing = existing;
+      }
+      else if (existing)
+      {
+        if (equipped || !update)
+        {
+          LOG_ERROR("module.ascension_compat",
+              "Refused occupied live starter destination for class {} item {} bag {} slot {}; found item {} count {}",
+              uint32(entry->ClassId), entry->ItemId, uint32(entry->Bag), uint32(entry->Slot),
+              existing->GetEntry(), existing->GetCount());
+          return false;
+        }
+
+        // Rehome only an unrelated backpack item. Never delete it or move an existing equipped item. The
+        // destination is reserved away from every starter position and from other planned rehomes.
+        itemPlan.Conflicting = existing;
+        InventoryResult rehomeResult = EQUIP_ERR_BAG_FULL;
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        {
+          uint16 const candidate = uint16(INVENTORY_SLOT_BAG_0) << 8 | slot;
+          if (positions.contains(candidate) || rehomeDestinations.contains(candidate) ||
+              player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            continue;
+
+          ItemPosCountVec destination;
+          rehomeResult = player->CanStoreItem(INVENTORY_SLOT_BAG_0, slot, destination, existing, false);
+          if (rehomeResult == EQUIP_ERR_OK && destination.size() == 1 && destination.front().pos == candidate &&
+              destination.front().count == existing->GetCount())
+          {
+            itemPlan.RehomeDestination = candidate;
+            rehomeDestinations.insert(candidate);
+            break;
+          }
+        }
+
+        if (!itemPlan.RehomeDestination)
+        {
+          LOG_ERROR("module.ascension_compat",
+              "Cannot rehome conflicting live starter item for class {} item {} bag {} slot {}: existing item {} count {}, "
+              "result {}",
+              uint32(entry->ClassId), entry->ItemId, uint32(entry->Bag), uint32(entry->Slot),
+              existing->GetEntry(), existing->GetCount(), uint32(rehomeResult));
+          return false;
+        }
+      }
+
+      if (!itemPlan.Existing && !itemPlan.Conflicting && equipped)
+      {
+        InventoryResult const result = player->CanEquipNewItem(
+            entry->Slot, itemPlan.EquipmentDestination, entry->ItemId, false);
+        if (result != EQUIP_ERR_OK || itemPlan.EquipmentDestination != position)
+        {
+          LOG_ERROR("module.ascension_compat", "Cannot equip live starter class {} item {} in slot {}: {}",
+              uint32(entry->ClassId), entry->ItemId, uint32(entry->Slot), uint32(result));
+          return false;
+        }
+      }
+      else if (!itemPlan.Existing && !itemPlan.Conflicting)
+      {
+        itemPlan.BagDestinations.clear();
+        InventoryResult const result = player->CanStoreNewItem(entry->Bag, entry->Slot, itemPlan.BagDestinations,
+            entry->ItemId, entry->Count);
+        if (result != EQUIP_ERR_OK || itemPlan.BagDestinations.size() != 1 ||
+            itemPlan.BagDestinations.front().pos != position || itemPlan.BagDestinations.front().count != entry->Count)
+        {
+          LOG_ERROR("module.ascension_compat", "Cannot store live starter class {} item {} in slot {}: {}",
+              uint32(entry->ClassId), entry->ItemId, uint32(entry->Slot), uint32(result));
+          return false;
+        }
+      }
+      validated.push_back(std::move(itemPlan));
+    }
+
+    struct CreatedStarterItem
+    {
+      uint8 Bag;
+      uint8 Slot;
+      Item* Object;
+    };
+    struct RelocatedStarterItem
+    {
+      Item* Object;
+      uint8 SourceBag;
+      uint8 SourceSlot;
+      uint16 Destination;
+    };
+    std::vector<CreatedStarterItem> created;
+    std::vector<RelocatedStarterItem> relocated;
+    auto rollbackCreated = [&player, &created]()
+    {
+      for (auto itr = created.rbegin(); itr != created.rend(); ++itr)
+        if (player->GetItemByPos(itr->Bag, itr->Slot) == itr->Object)
+          player->DestroyItem(itr->Bag, itr->Slot, true);
+    };
+    auto rollbackRelocated = [&player, &relocated]()
+    {
+      for (auto itr = relocated.rbegin(); itr != relocated.rend(); ++itr)
+      {
+        if (player->GetItemByPos(INVENTORY_SLOT_BAG_0, itr->Destination) != itr->Object)
+          continue;
+        player->MoveItemFromInventory(INVENTORY_SLOT_BAG_0, itr->Destination, true);
+        ItemPosCountVec source{ ItemPosCount(
+            (uint16(itr->SourceBag) << 8) | itr->SourceSlot, itr->Object->GetCount()) };
+        player->MoveItemToInventory(source, itr->Object, true);
+      }
+    };
+
+    for (ValidatedStarterItem const& plan : validated)
+    {
+      if (!plan.Conflicting)
+        continue;
+
+      AscensionCompatData::LiveStarterItem const& entry = *plan.Entry;
+      Item* const item = plan.Conflicting;
+      if (player->GetItemByPos(entry.Bag, entry.Slot) != item)
+      {
+        LOG_ERROR("module.ascension_compat",
+            "Conflicting live starter item changed before rehome for class {} bag {} slot {}",
+            uint32(entry.ClassId), uint32(entry.Bag), uint32(entry.Slot));
+        rollbackRelocated();
+        return false;
+      }
+
+      player->MoveItemFromInventory(entry.Bag, entry.Slot, update);
+      ItemPosCountVec destination{ ItemPosCount(plan.RehomeDestination, item->GetCount()) };
+      player->MoveItemToInventory(destination, item, update);
+      if (player->GetItemByPos(INVENTORY_SLOT_BAG_0, plan.RehomeDestination) != item)
+      {
+        LOG_ERROR("module.ascension_compat", "Failed to rehome conflicting live starter item {} from bag {} slot {}",
+            item->GetEntry(), uint32(entry.Bag), uint32(entry.Slot));
+        ItemPosCountVec source{ ItemPosCount((uint16(entry.Bag) << 8) | entry.Slot, item->GetCount()) };
+        player->MoveItemToInventory(source, item, update);
+        rollbackRelocated();
+        return false;
+      }
+      relocated.push_back({ item, entry.Bag, entry.Slot, plan.RehomeDestination });
+    }
+
+    // Revalidate the exact backpack destinations after planned rehomes have made them empty.
+    for (ValidatedStarterItem& plan : validated)
+    {
+      AscensionCompatData::LiveStarterItem const& entry = *plan.Entry;
+      if (plan.Existing || entry.Slot < EQUIPMENT_SLOT_END)
+        continue;
+
+      plan.BagDestinations.clear();
+      InventoryResult const result = player->CanStoreNewItem(entry.Bag, entry.Slot, plan.BagDestinations,
+          entry.ItemId, entry.Count);
+      uint16 const position = uint16(entry.Bag) << 8 | entry.Slot;
+      if (result != EQUIP_ERR_OK || plan.BagDestinations.size() != 1 ||
+          plan.BagDestinations.front().pos != position || plan.BagDestinations.front().count != entry.Count)
+      {
+        LOG_ERROR("module.ascension_compat", "Cannot store live starter class {} item {} in slot {} after rehome: {}",
+            uint32(entry.ClassId), entry.ItemId, uint32(entry.Slot), uint32(result));
+        rollbackRelocated();
+        return false;
+      }
+    }
+
+    for (ValidatedStarterItem const& plan : validated)
+    {
+      AscensionCompatData::LiveStarterItem const& entry = *plan.Entry;
+      if (plan.Existing)
+      {
+        if (player->GetItemByPos(entry.Bag, entry.Slot) != plan.Existing)
+        {
+          LOG_ERROR("module.ascension_compat",
+              "Authoritative existing live starter item changed for class {} item {} bag {} slot {}",
+              uint32(entry.ClassId), entry.ItemId, uint32(entry.Bag), uint32(entry.Slot));
+          rollbackRelocated();
+          return false;
+        }
+        continue;
+      }
+
+      Item* createdItem = entry.Slot < EQUIPMENT_SLOT_END
+          ? player->EquipNewItem(plan.EquipmentDestination, entry.ItemId, update)
+          : player->StoreNewItem(plan.BagDestinations, entry.ItemId, update);
+      if (!createdItem || createdItem->GetEntry() != entry.ItemId || createdItem->GetCount() != entry.Count ||
+          player->GetItemByPos(entry.Bag, entry.Slot) != createdItem)
+      {
+        LOG_ERROR("module.ascension_compat", "Failed exact live starter placement for class {} item {} bag {} slot {}",
+            uint32(entry.ClassId), entry.ItemId, uint32(entry.Bag), uint32(entry.Slot));
+        rollbackCreated();
+        rollbackRelocated();
+        return false;
+      }
+      created.push_back({ entry.Bag, entry.Slot, createdItem });
+    }
+
+    return true;
+  }
+
+  bool InitializePlayerbotStarterKit(Player* player)
+  {
+    return InitializeLiveStarterItems(player, true);
+  }
+
   // Creation-only entry point. The caller must abort Player::Create on false
   // and skip both legacy starter placement and the later bag auto-equip pass.
   // Login/repair paths deliberately never call this function.
@@ -1120,80 +1371,8 @@ public:
         return false;
       }
 
-    uint32 entries = 0;
-    std::unordered_set<uint16> positions;
-    for (AscensionCompatData::LiveStarterItem const& entry : AscensionCompatData::LiveStarterItems)
-    {
-      if (entry.ClassId != player->getClass())
-        continue;
-
-      bool const equipped = entry.Slot < EQUIPMENT_SLOT_END;
-      uint16 const position = uint16(entry.Bag) << 8 | entry.Slot;
-      ItemTemplate const* item = sObjectMgr->GetItemTemplate(entry.ItemId);
-      if (entry.Bag != INVENTORY_SLOT_BAG_0 ||
-          (!equipped && (entry.Slot < INVENTORY_SLOT_ITEM_START || entry.Slot >= INVENTORY_SLOT_ITEM_END)) ||
-          !entry.Count || !item || entry.Count > item->GetMaxStackSize() ||
-          (equipped && entry.Count != 1) || !positions.insert(position).second)
-      {
-        LOG_ERROR("module.ascension_compat", "Invalid live starter class {} item {} slot {} count {}", uint32(entry.ClassId), entry.ItemId, uint32(entry.Slot), entry.Count);
-        return false;
-      }
-
-      if (equipped)
-      {
-        uint16 destination = 0;
-        InventoryResult const result = player->CanEquipNewItem(entry.Slot, destination, entry.ItemId, false);
-        if (result != EQUIP_ERR_OK || destination != position)
-        {
-          LOG_ERROR("module.ascension_compat", "Cannot equip live starter class {} item {} in slot {}: {}", uint32(entry.ClassId), entry.ItemId, uint32(entry.Slot), uint32(result));
-          return false;
-        }
-      }
-      else
-      {
-        ItemPosCountVec destinations;
-        InventoryResult const result = player->CanStoreNewItem(entry.Bag, entry.Slot, destinations, entry.ItemId, entry.Count);
-        if (result != EQUIP_ERR_OK || destinations.size() != 1 ||
-            destinations.front().pos != position || destinations.front().count != entry.Count)
-        {
-          LOG_ERROR("module.ascension_compat", "Cannot store live starter class {} item {} in slot {}: {}", uint32(entry.ClassId), entry.ItemId, uint32(entry.Slot), uint32(result));
-          return false;
-        }
-      }
-      ++entries;
-    }
-    if (!entries)
+    if (!InitializeLiveStarterItems(player, false))
       return false;
-
-    // The generated order is equipment first (main hand before off hand), then
-    // backpack positions. Equal item IDs in different slots remain distinct.
-    for (AscensionCompatData::LiveStarterItem const& entry : AscensionCompatData::LiveStarterItems)
-    {
-      if (entry.ClassId != player->getClass())
-        continue;
-
-      uint16 const position = uint16(entry.Bag) << 8 | entry.Slot;
-      Item* created = nullptr;
-      if (entry.Slot < EQUIPMENT_SLOT_END)
-      {
-        uint16 destination = 0;
-        if (player->CanEquipNewItem(entry.Slot, destination, entry.ItemId, false) == EQUIP_ERR_OK && destination == position)
-          created = player->EquipNewItem(destination, entry.ItemId, false);
-      }
-      else
-      {
-        ItemPosCountVec destinations;
-        if (player->CanStoreNewItem(entry.Bag, entry.Slot, destinations, entry.ItemId, entry.Count) == EQUIP_ERR_OK &&
-            destinations.size() == 1 && destinations.front().pos == position && destinations.front().count == entry.Count)
-          created = player->StoreNewItem(destinations, entry.ItemId, false);
-      }
-      if (!created || created->GetEntry() != entry.ItemId || created->GetCount() != entry.Count ||
-          player->GetItemByPos(entry.Bag, entry.Slot) != created)
-      {
-        LOG_ERROR("module.ascension_compat", "Failed exact live starter placement for class {} item {} slot {}", uint32(entry.ClassId), entry.ItemId, uint32(entry.Slot));
-        return false;
-      }
-    }
 
     // Saved with the initial character transaction, not after the create
     // callback. This also prevents the legacy login repair from adding old gear.
@@ -7025,6 +7204,12 @@ bool SetAscensionTalentRank(Player* player, uint32 entryId, uint32 rank)
 bool IsAscensionCustomClassId(uint8 classId)
 {
     return classId >= CLASS_BARBARIAN && classId <= CLASS_SPIRIT_MAGE;
+}
+
+bool InitializeAscensionPlayerbotStarterKit(Player* player)
+{
+    return player && ascensionCompatConfig.GetConfigValue<bool>(AscensionCompatConfig::ENABLED) &&
+        AscensionClassService::Instance().InitializePlayerbotStarterKit(player);
 }
 
 std::vector<AscensionClassAbility> GetAscensionClassAbilities(uint8 classId)
